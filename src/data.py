@@ -50,7 +50,8 @@ class EncodedFilesDataset(data.Dataset):
         self.path = Path(top)
         self.seq_len = seq_len
         self.file_types = [file_type] if file_type else self.FILE_TYPES
-        self.file_paths = self.filter_paths(self.path.glob('**/*'), self.file_types)
+        self.file_paths = self.filter_paths(
+            self.path.glob('**/*'), self.file_types)
         self.epoch_len = epoch_len
 
     @staticmethod
@@ -130,7 +131,8 @@ class EncodedFilesDataset(data.Dataset):
             logger.warn('File "%s" has length %s, segment length is %s',
                         file, file_length_sec, segment_length_sec)
 
-        start_time = random.random() * (file_length_sec - segment_length_sec * 2)  # just in case
+        start_time = random.random() * (file_length_sec -
+                                        segment_length_sec * 2)  # just in case
         try:
             wav_data = self._file_slice(file, start_time)
         except Exception as e:
@@ -148,13 +150,15 @@ class EncodedFilesDataset(data.Dataset):
 
     def dump_to_folder(self, output: Path, norm_db=False):
         for file_path in tqdm.tqdm(self.file_paths):
-            output_file_path = output / file_path.relative_to(self.path).with_suffix('.h5')
+            output_file_path = output / \
+                file_path.relative_to(self.path).with_suffix('.h5')
             output_file_path.parent.mkdir(parents=True, exist_ok=True)
             with NamedTemporaryFile(suffix='.wav') as output_wav_file, \
                     NamedTemporaryFile(suffix='.wav') as norm_file_path, \
                     NamedTemporaryFile(suffix='.wav') as wav_convert_file:
                 if norm_db:
-                    logger.debug(f'Converting {file_path} to {wav_convert_file.name}')
+                    logger.debug(
+                        f'Converting {file_path} to {wav_convert_file.name}')
                     subprocess.run(['ffmpeg',
                                     '-y',
                                     '-i', file_path,
@@ -162,7 +166,8 @@ class EncodedFilesDataset(data.Dataset):
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
 
-                    logger.debug(f'Companding {wav_convert_file.name} to {norm_file_path.name}')
+                    logger.debug(
+                        f'Companding {wav_convert_file.name} to {norm_file_path.name}')
                     subprocess.run(['sox',
                                     '-G',
                                     wav_convert_file.name,
@@ -179,7 +184,8 @@ class EncodedFilesDataset(data.Dataset):
                 else:
                     input_file_path = file_path
 
-                logger.debug(f'Converting {input_file_path} to {output_wav_file.name}')
+                logger.debug(
+                    f'Converting {input_file_path} to {output_wav_file.name}')
                 subprocess.run(['ffmpeg',
                                 '-v', 'quiet',
                                 '-y',  # overwrite
@@ -253,7 +259,8 @@ class H5Dataset(data.Dataset):
                 if self.dataset_name == 'wav':
                     ret = [mu_law(x / 2 ** 15) for x in ret]
             except Exception as e:
-                logger.info('Exception %s in dataset __getitem__, path %s', e, self.path)
+                logger.info(
+                    'Exception %s in dataset __getitem__, path %s', e, self.path)
                 logger.debug('Exception in H5Dataset', exc_info=True)
 
         return torch.tensor(ret[0]), torch.tensor(ret[1])
@@ -314,35 +321,74 @@ class WavFrequencyAugmentation:
 
         ret = np.concatenate([wav[:perturb_start],
                               librosa.effects.pitch_shift(wav[perturb_start:perturb_end],
-                                                          self.wav_freq, pitch_perturb),
+                                                          sr=self.wav_freq, n_steps=pitch_perturb),
                               wav[perturb_end:]])
 
         return ret
 
 
+class RoundRobinDataset(data.Dataset):
+    def __init__(self, datasets, max_len, rotation_size):
+        self.datasets = datasets
+        self.max_len = max_len
+        self.rotation_size = rotation_size
+
+    def __len__(self):
+        return self.max_len
+
+    def __getitem__(self, idx):
+        dataset_idx = idx // self.rotation_size % len(self.datasets)
+        return *self.datasets[dataset_idx][0], dataset_idx
+
+
 class DatasetSet:
-    def __init__(self, dir: Path, seq_len, args):
+    def __init__(self, dirs: Path, seq_len, args):
         if args.data_aug:
-            augmentation = WavFrequencyAugmentation(EncodedFilesDataset.WAV_FREQ, args.magnitude)
+            augmentation = WavFrequencyAugmentation(
+                EncodedFilesDataset.WAV_FREQ, args.magnitude)
         else:
             augmentation = None
 
-        self.train_dataset = H5Dataset(dir / 'train', seq_len, epoch_len=10000000000,
-                                       dataset_name=args.h5_dataset_name, augmentation=augmentation,
-                                       short=args.short, cache=False)
+        self.train_dataset = RoundRobinDataset(
+            [H5Dataset(dir / 'train', seq_len, epoch_len=1,
+                       dataset_name=args.h5_dataset_name, augmentation=augmentation,
+                       short=args.short, cache=False) for dir in dirs],
+            args.epochs * args.epoch_len * args.world_size * args.batch_size,
+            args.world_size * args.batch_size
+        )
+        self.train_sampler = data.DistributedSampler(
+            self.train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=False,
+            drop_last=False
+        )
         self.train_loader = data.DataLoader(self.train_dataset,
                                             batch_size=args.batch_size,
+                                            sampler=self.train_sampler,
                                             num_workers=args.num_workers,
                                             pin_memory=True)
 
         self.train_iter = iter(self.train_loader)
 
-        self.valid_dataset = H5Dataset(dir / 'val', seq_len, epoch_len=1000000000,
-                                       dataset_name=args.h5_dataset_name, augmentation=augmentation,
-                                       short=args.short)
+        self.valid_dataset = RoundRobinDataset(
+            [H5Dataset(dir / 'val', seq_len, epoch_len=1,
+                       dataset_name=args.h5_dataset_name, augmentation=augmentation,
+                       short=args.short) for dir in dirs],
+            args.epochs * int(np.ceil(args.epoch_len / 10)) *
+            args.world_size * args.batch_size,
+            args.world_size * args.batch_size)
+
+        self.valid_sampler = data.DistributedSampler(
+            self.valid_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=False,
+            drop_last=False
+        )
         self.valid_loader = data.DataLoader(self.valid_dataset,
                                             batch_size=args.batch_size,
                                             num_workers=args.num_workers // 10 + 1,
-                                            pin_memory=True)
+                                            pin_memory=False,)
 
         self.valid_iter = iter(self.valid_loader)

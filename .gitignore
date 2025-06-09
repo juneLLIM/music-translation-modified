@@ -2,9 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.venv2
 # C extensions
 *.so
+data
 
 # Distribution / packaging
 .Python

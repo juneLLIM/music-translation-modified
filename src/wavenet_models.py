@@ -71,7 +71,6 @@ class Encoder(nn.Module):
         x = x / 255 - .5
         if x.dim() < 3:
             x = x.unsqueeze(1)
-
         x = self.start(x)
         x = self.dilated_convs(x)
         x = self.conv_1x1(x)

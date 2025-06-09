@@ -4,6 +4,16 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
+from utils import create_output_dir, LossMeter, wrap
+from wavenet_models import cross_entropy_loss, Encoder, ZDiscriminator
+from wavenet import WaveNet
+from data import DatasetSet
+from tqdm import tqdm
+from pathlib import Path
+import numpy as np
+from itertools import chain
+import argparse
+import os
 import torch
 import torch.optim as optim
 import torch.distributed as dist
@@ -13,19 +23,9 @@ from torch.nn.utils import clip_grad_value_
 torch.backends.cudnn.benchmark = True
 torch.multiprocessing.set_start_method('spawn', force=True)
 
-import os
-import argparse
-from itertools import chain
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
 
-from data import DatasetSet
-from wavenet import WaveNet
-from wavenet_models import cross_entropy_loss, Encoder, ZDiscriminator
-from utils import create_output_dir, LossMeter, wrap
-
-parser = argparse.ArgumentParser(description='PyTorch Code for A Universal Music Translation Network')
+parser = argparse.ArgumentParser(
+    description='PyTorch Code for A Universal Music Translation Network')
 # Env options:
 parser.add_argument('--epochs', type=int, default=10000, metavar='N',
                     help='number of epochs to train (default: 92)')
@@ -45,7 +45,7 @@ parser.add_argument('--per-epoch', action='store_true',
 parser.add_argument('--dist-url', default='env://',
                     help='Distributed training parameters URL')
 parser.add_argument('--dist-backend', default='nccl')
-parser.add_argument('--local_rank', type=int,
+parser.add_argument('--local-rank', type=int,
                     help='Ignored during training.')
 
 # Data options
@@ -61,7 +61,11 @@ parser.add_argument('--data-aug', action='store_true',
                     help='Turns data aug on')
 parser.add_argument('--magnitude', type=float, default=0.5,
                     help='Data augmentation magnitude.')
-parser.add_argument('--lr', type=float, default=1e-4,
+parser.add_argument('--encoder-lr', type=float, default=1e-4,
+                    help='Learning rate')
+parser.add_argument('--decoder-lr', type=float, default=1e-3,
+                    help='Learning rate')
+parser.add_argument('--discriminator-lr', type=float, default=1e-4,
                     help='Learning rate')
 parser.add_argument('--lr-decay', type=float, default=0.98,
                     help='new LR = old LR * decay')
@@ -125,67 +129,83 @@ class Trainer:
         torch.cuda.manual_seed(args.seed)
 
         self.logger = create_output_dir(args, self.expPath)
-        self.data = [DatasetSet(d, args.seq_len, args) for d in args.data]
-        assert not args.distributed or len(self.data) == int(
-            os.environ['WORLD_SIZE']), "Number of datasets must match number of nodes"
-
-        self.losses_recon = [LossMeter(f'recon {i}') for i in range(self.args.n_datasets)]
+        self.data = DatasetSet(args.data, args.seq_len, args)
+        self.losses_recon = [
+            LossMeter(f'recon {i}') for i in range(self.args.n_datasets)]
         self.loss_d_right = LossMeter('d')
         self.loss_total = LossMeter('total')
 
-        self.evals_recon = [LossMeter(f'recon {i}') for i in range(self.args.n_datasets)]
+        self.evals_recon = [LossMeter(f'recon {i}')
+                            for i in range(self.args.n_datasets)]
         self.eval_d_right = LossMeter('eval d')
         self.eval_total = LossMeter('eval total')
 
         self.encoder = Encoder(args)
-        self.decoder = WaveNet(args)
+        self.decoders = torch.nn.ModuleList(
+            [WaveNet(args) for _ in range(self.args.n_datasets)])
         self.discriminator = ZDiscriminator(args)
 
         if args.checkpoint:
-            checkpoint_args_path = os.path.dirname(args.checkpoint) + '/args.pth'
-            checkpoint_args = torch.load(checkpoint_args_path)
+            checkpoint_args_path = os.path.dirname(
+                args.checkpoint) + '/args.pth'
+            checkpoint_args = torch.load(
+                checkpoint_args_path, weights_only=False)
 
             self.start_epoch = checkpoint_args[-1] + 1
             states = torch.load(args.checkpoint)
 
-            self.encoder.load_state_dict(states['encoder_state'])
-            self.decoder.load_state_dict(states['decoder_state'])
-            self.discriminator.load_state_dict(states['discriminator_state'])
+            if 'musicnet' in args.checkpoint:
+                self.encoder.load_state_dict(states['encoder_state'])
+            else:
+                self.encoder.load_state_dict(states['encoder_state'])
+                for i, decoder in enumerate(self.decoders):
+                    decoder.load_state_dict(states['decoder_state'][i])
+                self.discriminator.load_state_dict(
+                    states['discriminator_state'])
 
             self.logger.info('Loaded checkpoint parameters')
         else:
             self.start_epoch = 0
 
-        if args.distributed:
-            self.encoder.cuda()
-            self.encoder = torch.nn.parallel.DistributedDataParallel(self.encoder)
-            self.discriminator.cuda()
-            self.discriminator = torch.nn.parallel.DistributedDataParallel(self.discriminator)
-            self.logger.info('Created DistributedDataParallel')
-        else:
-            self.encoder = torch.nn.DataParallel(self.encoder).cuda()
-            self.discriminator = torch.nn.DataParallel(self.discriminator).cuda()
-        self.decoder = torch.nn.DataParallel(self.decoder).cuda()
+        self.encoder = torch.nn.parallel.DistributedDataParallel(
+            self.encoder.to(args.rank), device_ids=[args.rank])
+        self.decoders = torch.nn.ModuleList([torch.nn.parallel.DistributedDataParallel(
+            decoder.to(args.rank), device_ids=[args.rank], find_unused_parameters=True) for decoder in self.decoders])
+        self.discriminator = torch.nn.parallel.DistributedDataParallel(
+            self.discriminator.to(args.rank), device_ids=[args.rank])
+        self.logger.info('Created DistributedDataParallel')
 
-        self.model_optimizer = optim.Adam(chain(self.encoder.parameters(),
-                                                self.decoder.parameters()),
-                                          lr=args.lr)
-        self.d_optimizer = optim.Adam(self.discriminator.parameters(),
-                                      lr=args.lr)
+        self.encoder_optimizer = optim.Adam(
+            self.encoder.parameters(), lr=args.encoder_lr)
+        self.decoder_optimizers = [optim.Adam(
+            decoder.parameters(), lr=args.decoder_lr) for decoder in self.decoders]
+        self.d_optimizer = optim.Adam(
+            self.discriminator.parameters(), lr=args.discriminator_lr)
 
-        if args.checkpoint and args.load_optimizer:
-            self.model_optimizer.load_state_dict(states['model_optimizer_state'])
-            self.d_optimizer.load_state_dict(states['d_optimizer_state'])
+        if args.checkpoint and 'musicnet' not in args.checkpoint:
+            self.encoder_optimizer.load_state_dict(
+                states['encoder_optimizer_state'])
+            for i, opt in enumerate(self.decoder_optimizers):
+                opt.load_state_dict(states['decoder_optimizer_state'][i])
+            self.d_optimizer.load_state_dict(
+                states['d_optimizer_state'])
 
-        self.lr_manager = torch.optim.lr_scheduler.ExponentialLR(self.model_optimizer, args.lr_decay)
-        self.lr_manager.last_epoch = self.start_epoch
-        self.lr_manager.step()
+        self.encoder_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.encoder_optimizer, args.lr_decay)
+        self.decoder_schedulers = [
+            torch.optim.lr_scheduler.ExponentialLR(opt, args.lr_decay)
+            for opt in self.decoder_optimizers
+        ]
+
+        self.encoder_scheduler.last_epoch = self.start_epoch
+        for scheduler in self.decoder_schedulers:
+            scheduler.last_epoch = self.start_epoch
 
     def eval_batch(self, x, x_aug, dset_num):
         x, x_aug = x.float(), x_aug.float()
 
         z = self.encoder(x)
-        y = self.decoder(x, z)
+        y = self.decoders[dset_num](x, z)
         z_logits = self.discriminator(z)
 
         z_classification = torch.max(z_logits, dim=1)[1]
@@ -195,13 +215,14 @@ class Trainer:
         self.eval_d_right.add(z_accuracy.data.item())
 
         # discriminator_right = F.cross_entropy(z_logits, dset_num).mean()
-        discriminator_right = F.cross_entropy(z_logits, torch.tensor([dset_num] * x.size(0)).long().cuda()).mean()
+        discriminator_right = F.cross_entropy(z_logits, torch.tensor(
+            [dset_num] * x.size(0)).long().to(self.args.rank)).mean()
         recon_loss = cross_entropy_loss(y, x)
 
         self.evals_recon[dset_num].add(recon_loss.data.cpu().numpy().mean())
 
         total_loss = discriminator_right.data.item() * self.args.d_lambda + \
-                     recon_loss.mean().data.item()
+            recon_loss.mean().data.item()
 
         self.eval_total.add(total_loss)
 
@@ -213,20 +234,24 @@ class Trainer:
         # Optimize D - discriminator right
         z = self.encoder(x)
         z_logits = self.discriminator(z)
-        discriminator_right = F.cross_entropy(z_logits, torch.tensor([dset_num] * x.size(0)).long().cuda()).mean()
+        discriminator_right = F.cross_entropy(z_logits, torch.tensor(
+            [dset_num] * x.size(0)).long().to(self.args.rank)).mean()
         loss = discriminator_right * self.args.d_lambda
         self.d_optimizer.zero_grad()
         loss.backward()
         if self.args.grad_clip is not None:
-            clip_grad_value_(self.discriminator.parameters(), self.args.grad_clip)
+            clip_grad_value_(self.discriminator.parameters(),
+                             self.args.grad_clip)
 
         self.d_optimizer.step()
 
         # optimize G - reconstructs well, discriminator wrong
         z = self.encoder(x_aug)
-        y = self.decoder(x, z)
+        y = self.decoders[dset_num](x, z)
         z_logits = self.discriminator(z)
-        discriminator_wrong = - F.cross_entropy(z_logits, torch.tensor([dset_num] * x.size(0)).long().cuda()).mean()
+        discriminator_wrong = - \
+            F.cross_entropy(z_logits, torch.tensor(
+                [dset_num] * x.size(0)).long().to(self.args.rank)).mean()
 
         if not (-100 < discriminator_right.data.item() < 100):
             self.logger.debug(f'z_logits: {z_logits.detach().cpu().numpy()}')
@@ -237,48 +262,43 @@ class Trainer:
 
         loss = (recon_loss.mean() + self.args.d_lambda * discriminator_wrong)
 
-        self.model_optimizer.zero_grad()
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizers[dset_num].zero_grad()
         loss.backward()
         if self.args.grad_clip is not None:
             clip_grad_value_(self.encoder.parameters(), self.args.grad_clip)
-            clip_grad_value_(self.decoder.parameters(), self.args.grad_clip)
-        self.model_optimizer.step()
+            clip_grad_value_(
+                self.decoders[dset_num].parameters(), self.args.grad_clip)
+        self.encoder_optimizer.step()
+        self.decoder_optimizers[dset_num].step()
 
         self.loss_total.add(loss.data.item())
 
         return loss.data.item()
 
     def train_epoch(self, epoch):
+
         for meter in self.losses_recon:
             meter.reset()
+
         self.loss_d_right.reset()
         self.loss_total.reset()
 
         self.encoder.train()
-        self.decoder.train()
+        self.decoders.train()
         self.discriminator.train()
 
         n_batches = self.args.epoch_len
 
         with tqdm(total=n_batches, desc='Train epoch %d' % epoch) as train_enum:
-            for batch_num in range(n_batches):
-                if self.args.short and batch_num == 3:
-                    break
+            for _ in range(n_batches):
+                x, x_aug, dset_num = next(self.data.train_iter)
+                x = x.to(self.args.rank)
+                x_aug = x_aug.to(self.args.rank)
+                batch_loss = self.train_batch(x, x_aug, dset_num[0])
 
-                if self.args.distributed:
-                    assert self.args.rank < self.args.n_datasets, "No. of workers must be equal to #dataset"
-                    # dset_num = (batch_num + self.args.rank) % self.args.n_datasets
-                    dset_num = self.args.rank
-                else:
-                    dset_num = batch_num % self.args.n_datasets
-
-                x, x_aug = next(self.data[dset_num].train_iter)
-
-                x = wrap(x)
-                x_aug = wrap(x_aug)
-                batch_loss = self.train_batch(x, x_aug, dset_num)
-
-                train_enum.set_description(f'Train (loss: {batch_loss:.2f}) epoch {epoch}')
+                train_enum.set_description(
+                    f'Train (loss: {batch_loss:.2f}) epoch {epoch}')
                 train_enum.update()
 
     def evaluate_epoch(self, epoch):
@@ -288,30 +308,23 @@ class Trainer:
         self.eval_total.reset()
 
         self.encoder.eval()
-        self.decoder.eval()
+        self.decoders.eval()
         self.discriminator.eval()
 
         n_batches = int(np.ceil(self.args.epoch_len / 10))
 
-        with tqdm(total=n_batches) as valid_enum, \
-                torch.no_grad():
+        with tqdm(total=n_batches) as valid_enum, torch.no_grad():
             for batch_num in range(n_batches):
                 if self.args.short and batch_num == 10:
                     break
 
-                if self.args.distributed:
-                    assert self.args.rank < self.args.n_datasets, "No. of workers must be equal to #dataset"
-                    dset_num = self.args.rank
-                else:
-                    dset_num = batch_num % self.args.n_datasets
+                x, x_aug, dset_num = next(self.data.valid_iter)
+                x = x.to(self.args.rank)
+                x_aug = x_aug.to(self.args.rank)
+                batch_loss = self.eval_batch(x, x_aug, dset_num[0])
 
-                x, x_aug = next(self.data[dset_num].valid_iter)
-
-                x = wrap(x)
-                x_aug = wrap(x_aug)
-                batch_loss = self.eval_batch(x, x_aug, dset_num)
-
-                valid_enum.set_description(f'Test (loss: {batch_loss:.2f}) epoch {epoch}')
+                valid_enum.set_description(
+                    f'Test (loss: {batch_loss:.2f}) epoch {epoch}')
                 valid_enum.update()
 
     @staticmethod
@@ -332,25 +345,28 @@ class Trainer:
 
         # Begin!
         for epoch in range(self.start_epoch, self.start_epoch + self.args.epochs):
-            self.logger.info(f'Starting epoch, Rank {self.args.rank}, Dataset: {self.args.data[self.args.rank]}')
+            self.logger.info(f'Starting epoch')
             self.train_epoch(epoch)
             self.evaluate_epoch(epoch)
 
             self.logger.info(f'Epoch %s Rank {self.args.rank} - Train loss: (%s), Test loss (%s)',
                              epoch, self.train_losses(), self.eval_losses())
-            self.lr_manager.step()
+
+            self.encoder_scheduler.step()
+            for scheduler in self.decoder_schedulers:
+                scheduler.step()
             val_loss = self.eval_total.summarize_epoch()
 
-            if val_loss < best_eval:
-                self.save_model(f'bestmodel_{self.args.rank}.pth')
-                best_eval = val_loss
+            if self.args.rank == 0:
+                if val_loss < best_eval:
+                    self.save_model(f'bestmodel.pth')
+                    best_eval = val_loss
 
-            if not self.args.per_epoch:
-                self.save_model(f'lastmodel_{self.args.rank}.pth')
-            else:
-                self.save_model(f'lastmodel_{epoch}_rank_{self.args.rank}.pth')
+                if not self.args.per_epoch:
+                    self.save_model(f'lastmodel.pth')
+                else:
+                    self.save_model(f'lastmodel_epoch_{epoch}.pth')
 
-            if self.args.is_master:
                 torch.save([self.args,
                             epoch],
                            '%s/args.pth' % self.expPath)
@@ -361,10 +377,10 @@ class Trainer:
         save_path = self.expPath / filename
 
         torch.save({'encoder_state': self.encoder.module.state_dict(),
-                    'decoder_state': self.decoder.module.state_dict(),
+                    'decoder_state': [decoder.module.state_dict() for decoder in self.decoders],
                     'discriminator_state': self.discriminator.module.state_dict(),
-                    'model_optimizer_state': self.model_optimizer.state_dict(),
-                    'dataset': self.args.rank,
+                    'encoder_optimizer_state': self.encoder_optimizer.state_dict(),
+                    'decoder_optimizer_state': [opt.state_dict() for opt in self.decoder_optimizers],
                     'd_optimizer_state': self.d_optimizer.state_dict()
                     },
                    save_path)
@@ -374,30 +390,16 @@ class Trainer:
 
 def main():
     args = parser.parse_args()
-    args.distributed = False
-    if 'WORLD_SIZE' in os.environ:
-        args.distributed = int(os.environ['WORLD_SIZE']) > 1
-
-    if args.distributed:
-        # import ipdb; ipdb.set_trace()
-        # if 'MASTER_ADDR' not in os.environ:
-        #     var = os.environ["SLURM_NODELIST"]
-        #     match = re.match(r'learnfair\[(\d+).*', var)
-        #     master_id = match.group(1)
-        #     os.environ["MASTER_ADDR"] = "learnfair" + master_id
-        #     print('Set MASTER_ADDR to', os.environ['MASTER_ADDR'])
-        if int(os.environ['RANK']) == 0:
-            args.is_master = True
-        else:
-            args.is_master = False
-        args.rank = int(os.environ['RANK'])
-
-        print('Before init_process_group')
-        dist.init_process_group(backend=args.dist_backend,
-                                init_method=args.dist_url)
-    else:
-        args.rank = 0
+    args.world_size = int(os.environ['WORLD_SIZE'])
+    args.rank = int(os.environ['RANK'])
+    if args.rank == 0:
         args.is_master = True
+    else:
+        args.is_master = False
+
+    print('Before init_process_group')
+    dist.init_process_group(backend=args.dist_backend,
+                            init_method=args.dist_url)
 
     Trainer(args).train()
 

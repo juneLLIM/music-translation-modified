@@ -6,6 +6,7 @@
 #
 
 from pathlib import Path
+from tabnanny import check
 import librosa
 import torch
 from argparse import ArgumentParser
@@ -59,7 +60,7 @@ def main(args):
     checkpoints = [c for c in checkpoints if extract_id(c) in args.decoders]
     assert len(checkpoints) >= 1, "No checkpoints found."
 
-    model_args = torch.load(args.checkpoint.parent / 'args.pth')[0]
+    model_args = torch.load(args.checkpoint.parent / 'args.pth', weights_only=False)[0]
     encoder = wavenet_models.Encoder(model_args)
     encoder.load_state_dict(torch.load(checkpoints[0])['encoder_state'])
     encoder.eval()
