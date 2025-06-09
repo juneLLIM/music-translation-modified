@@ -1,3 +1,9 @@
+# ※This is the non-official modification version of the git below※
+
+
+
+
+
 # Music Translation
 PyTorch implementation of the method described in the [A Universal Music Translation Network](https://arxiv.org/abs/1805.07848).
 
