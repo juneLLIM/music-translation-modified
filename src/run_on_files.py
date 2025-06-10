@@ -42,7 +42,8 @@ def parse_args():
                         help='Size of splits')
     parser.add_argument('--output-next-to-orig', action='store_true')
     parser.add_argument('--skip-filter', action='store_true')
-    parser.add_argument('--py', action='store_true', help='Use python generator')
+    parser.add_argument('--py', action='store_true',
+                        help='Use python generator')
 
     return parser.parse_args()
 
@@ -56,11 +57,13 @@ def main(args):
     print('Starting')
     matplotlib.use('agg')
 
-    checkpoints = args.checkpoint.parent.glob(args.checkpoint.name + '_*.pth')
-    checkpoints = [c for c in checkpoints if extract_id(c) in args.decoders]
+    checkpoints = args.checkpoint.parent.glob(args.checkpoint.name + '.pth')
+
+    checkpoints = [c for c in checkpoints]
     assert len(checkpoints) >= 1, "No checkpoints found."
 
-    model_args = torch.load(args.checkpoint.parent / 'args.pth', weights_only=False)[0]
+    model_args = torch.load(args.checkpoint.parent /
+                            'args.pth', weights_only=False)[0]
     encoder = wavenet_models.Encoder(model_args)
     encoder.load_state_dict(torch.load(checkpoints[0])['encoder_state'])
     encoder.eval()
@@ -69,17 +72,20 @@ def main(args):
     decoders = []
     decoder_ids = []
     for checkpoint in checkpoints:
-        decoder = WaveNet(model_args)
-        decoder.load_state_dict(torch.load(checkpoint)['decoder_state'])
-        decoder.eval()
-        decoder = decoder.cuda()
-        if args.py:
-            decoder = WavenetGenerator(decoder, args.batch_size, wav_freq=args.rate)
-        else:
-            decoder = NVWavenetGenerator(decoder, args.rate * (args.split_size // 20), args.batch_size, 3)
+        for i in args.decoders:
+            decoder = WaveNet(model_args)
+            decoder.load_state_dict(torch.load(checkpoint)['decoder_state'][i])
+            decoder.eval()
+            decoder = decoder.cuda()
+            if args.py:
+                decoder = WavenetGenerator(
+                    decoder, args.batch_size, wav_freq=args.rate)
+            else:
+                decoder = NVWavenetGenerator(
+                    decoder, args.rate * (args.split_size // 20), args.batch_size, 3)
 
-        decoders += [decoder]
-        decoder_ids += [extract_id(checkpoint)]
+            decoders += [decoder]
+            decoder_ids += [i]
 
     xs = []
     assert args.output_next_to_orig ^ (args.output is not None)
@@ -99,7 +105,8 @@ def main(args):
             assert rate == 16000
             data = utils.mu_law(data)
         elif file_path.suffix == '.h5':
-            data = utils.mu_law(h5py.File(file_path, 'r')['wav'][:] / (2 ** 15))
+            data = utils.mu_law(h5py.File(file_path, 'r')
+                                ['wav'][:] / (2 ** 15))
             if data.shape[-1] % args.rate != 0:
                 data = data[:-(data.shape[-1] % args.rate)]
             assert data.shape[-1] % args.rate == 0
@@ -122,9 +129,11 @@ def main(args):
         print(f'X min: {x.min()}, max: {x.max()}')
 
         if args.output_next_to_orig:
-            save_audio(wav.squeeze(), filepath.parent / f'{filepath.stem}_{decoder_ix}.wav', rate=args.rate)
+            save_audio(wav.squeeze(), filepath.parent /
+                       f'{filepath.stem}_{decoder_ix}.wav', rate=args.rate)
         else:
-            save_audio(wav.squeeze(), args.output / str(decoder_ix) / filepath.with_suffix('.wav').name, rate=args.rate)
+            save_audio(wav.squeeze(), args.output / str(decoder_ix) /
+                       filepath.with_suffix('.wav').name, rate=args.rate)
 
     yy = {}
     with torch.no_grad():
